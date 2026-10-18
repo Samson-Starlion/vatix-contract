@@ -7,6 +7,11 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
 
+/// Local mirror types shared with other contracts' cross-contract decoding
+/// (e.g. `vatix_market::types::MarketStatus`) — see `types.rs` for the full
+/// variant-sync requirements.
+pub mod types;
+
 /// Maximum number of bytes allowed in an outcome token symbol.
 pub const MAX_SYMBOL_LEN: u32 = 12;
 
@@ -259,6 +264,25 @@ mod test {
         let attacker = Address::generate(&env);
         let res = client.try_set_metadata(&attacker, &symbol(&env, 4), &name(&env, 4));
         assert_eq!(res, Err(Ok(OutcomeTokenError::Unauthorized)));
+    }
+
+    /// Issue #1035: `require_admin`'s deny-by-default branch — no
+    /// `DataKey::Admin` ever stored — must reject `set_metadata` even when
+    /// the caller self-authorizes, and must not write any metadata.
+    #[test]
+    fn set_metadata_rejects_non_admin_when_no_admin_is_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, OutcomeTokenContract);
+        let client = OutcomeTokenContractClient::new(&env, &contract_id);
+
+        // No `initialize` call: `DataKey::Admin` is never stored.
+        let caller = Address::generate(&env);
+        let res = client.try_set_metadata(&caller, &symbol(&env, 4), &name(&env, 4));
+        assert_eq!(res, Err(Ok(OutcomeTokenError::Unauthorized)));
+
+        // No metadata was ever written either.
+        assert_eq!(client.try_metadata(), Err(Ok(OutcomeTokenError::Unauthorized)));
     }
 
     #[test]

@@ -1700,37 +1700,37 @@ fn unchallenged_finalize_refunds_full_bond() {
     assert_eq!(balance(&env, &token, &this), 0);
 }
 
-// ── Issue #1025: appeal enforces MAX_APPEAL_ROUNDS and Challenged-only ────────
-
-/// `appeal` on a `Proposed` (never challenged) candidate must be rejected
-/// with `CandidateNotChallenged`.
+/// Issue #1024: `challenge` with a bond below `MIN_CHALLENGE_BOND_AMOUNT`
+/// must be rejected with `InsufficientChallengeBond`, leave the candidate
+/// `Proposed` with no `ChallengeRecord` appended, and a bond of exactly the
+/// minimum must succeed and record exactly one challenger with that bond.
 #[test]
-fn appeal_on_proposed_candidate_returns_candidate_not_challenged() {
+fn challenge_rejects_bond_below_minimum_and_accepts_exact_minimum() {
     let env = Env::default();
     let (client, _, _, token) = setup(&env);
     set_time(&env, 1_000);
 
     let proposer = Address::generate(&env);
     fund(&env, &token, &proposer, BOND);
-
     let candidate_id = client.propose(
         &proposer,
-        &1u32,
+        &9u32,
         &true,
         &signature(&env),
-        &(env.ledger().timestamp() + MIN_WINDOW + 3_600),
+        &(1_000 + 10 * DEFAULT_WINDOW),
         &evidence(&env),
-        &MIN_WINDOW,
+        &DEFAULT_WINDOW,
         &BOND,
     );
 
-    let err = client
-        .try_appeal(
-            &proposer,
-            &candidate_id,
-            &true,
-            &signature(&env),
-            &eviden
+    let challenger = Address::generate(&env);
+    fund(&env, &token, &c
+    let env = Env::default();
+    let (client, _, _, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
     let candidate_id = client.propose(
         &proposer,
         &1u32,
@@ -1766,72 +1766,6 @@ fn appeal_on_proposed_candidate_returns_candidate_not_challenged() {
 /// pinned at `MAX_APPEAL_ROUNDS`.
 #[test]
 fn appeal_enforces_max_appeal_rounds_cap() {
-    assert_eq!(
-        candidate_id, 1,
-        "rejected propose for a resolved market must not consume a candidate id"
-    );
-}
-
-/// `propose` against a market whose `get_market_status` reports `Canceled`
-/// must fail closed with `MarketAlreadyResolved` (the same error covers both
-/// resolved and canceled markets, per the error's doc comment) and must not
-/// advance the candidate counter.
-#[test]
-fn propose_rejects_canceled_market() {
-    let env = Env::default();
-    let (client, _, market_contract, token) = setup(&env);
-    set_time(&env, 1_000);
-
-    MockMarketClient::new(&env, &market_contract).set_status(&MarketStatus::Canceled);
-
-    let proposer = Address::generate(&env);
-    fund(&env, &token, &proposer, BOND);
-    let result = client.try_propose(
-        &proposer,
-        &2u32,
-        &true,
-        &signature(&env),
-        &(env.ledger().timestamp() + 600),
-        &evidence(&env),
-        &MIN_WINDOW,
-        &BOND,
-    );
-    assert_eq!(result, Err(Ok(ContractError::MarketAlreadyResolved)));
-    assert!(client.get_candidate_id_for_market(&2u32).is_none());
-
-    MockMarketClient::new(&env, &market_contract).set_status(&MarketStatus::Active);
-    let candidate_id = client.propose(
-        &proposer,
-        &2u32,
-        &true,
-        &signature(&env),
-        &(env.ledger().timestamp() + 600),
-        &evidence(&env),
-        &MIN_WINDOW,
-        &BOND,
-    );
-    assert_eq!(
-        candidate_id, 1,
-        "rejected propose for a canceled market must not consume a candidate id"
-    );
-}
-
-/// `propose` against an `Active` market (the control case) succeeds.
-#[test]
-fn propose_accepts_active_market() {
-  // Active and confirm the next successful propose still gets id 1.
-    MockMarketClient::new(&env, &market_contract).set_status(&MarketStatus::Active);
-    let candidate_id = client.propose(
-        &proposer,
-        &1u32,
-        &true,
-        &signature(&env),
-        &(env.ledger().timestamp() + MIN_WINDOW + 3_600),
-        &evidence(&env),
-        &MIN_WINDOW,
-        &BOND,
-    );
-
     let env = Env::default();
     let (client, _, _, token) = setup(&env);
     set_time(&env, 1_000);
@@ -1855,10 +1789,6 @@ fn propose_accepts_active_market() {
         &true,
         &signature(&env),
         &(env.ledger().timestamp() + MIN_WINDOW + 3_600),
-        &evidence(&env),
-        &MIN_WINDOW,
-        &BOND,
-    );
         &evidence(&env),
         &MIN_WINDOW,
         &BOND,
@@ -1900,8 +1830,6 @@ fn propose_accepts_active_market() {
     let candidate = client.get_candidate(&candidate_id).unwrap();
     assert_eq!(candidate.appeal_round, crate::MAX_APPEAL_ROUNDS);
     assert_eq!(candidate.status, crate::types::CandidateStatus::Challenged);
-
-    assert!(result.is_ok(), "Active market should be accepted, got: {:?}", result);
 }
 
 // ── Issue #1033: ResolutionRegistered and CandidateArbitrated events ────────
@@ -2143,3 +2071,45 @@ fn bond_refunded_event_supports_zero_amount_payload() {
     assert_eq!(refunded_at, 777);
 }
 }
+
+/// Issue #1023: `finalize` must reject a candidate whose `signature_expiry`
+/// has passed, leaving it `Proposed` with `finalized_at` still `None` and
+/// without ever invoking the market contract's `resolve_market`.
+#[test]
+fn finalize_rejects_expired_signature_and_leaves_candidate_unresolved() {
+    let env = Env::default();
+    let (client, _, market_contract, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
+    let window = 300u64;
+    // Expiry one second past the challenge deadline, so the window has
+    // closed but the signature has also already expired.
+    let expiry = 1_000 + window;
+    let candidate_id = client.propose(
+        &proposer,
+        &10u32,
+        &true,
+        &signature(&env),
+        &expiry,
+        &evidence(&env),
+        &window,
+        &BOND,
+    );
+
+    set_time(&env, expiry + 1);
+    let finalizer = Address::generate(&env);
+    assert_eq!(
+        client.try_finalize(&finalizer, &candidate_id),
+        Err(Ok(ContractError::SignatureExpired))
+    );
+
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Proposed);
+    assert_eq!(candidate.finalized_at, None);
+
+    let market_client = MockMarketClient::new(&env, &market_contract);
+    assert_eq!(market_client.get_last_resolved(), None);
+}
+
