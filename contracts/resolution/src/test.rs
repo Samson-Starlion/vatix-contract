@@ -1,5 +1,6 @@
 extern crate std;
 
+use crate::types::MarketStatus;
 use crate::{ContractError, ResolutionContract, ResolutionContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
@@ -1387,6 +1388,63 @@ fn count_events(env: &Env, name: &str) -> u32 {
     n
 }
 
+/// Find the first emitted event named `name` and return its topics vector
+/// and decoded data map. Used by event-payload tests that need to pick a
+/// specific event out of several fired by the same call (e.g. `BondSlashed`
+/// is emitted before `CandidateArbitrated` by `arbitrate_uphold_proposer`).
+fn find_event(env: &Env, name: &str) -> (soroban_sdk::Vec<Val>, Map<Symbol, Val>) {
+    let target = Symbol::new(env, name);
+    for ev in env.events().all().iter() {
+        if let Some(first) = ev.1.get(0) {
+            let topic: Result<Symbol, _> = first.try_into_val(env);
+            if topic == Ok(target.clone()) {
+                let data: Map<Symbol, Val> = ev.2.try_into_val(env).unwrap();
+                return (ev.1.clone(), data);
+            }
+        }
+    }
+    panic!("event `{}` not found", name);
+}
+
+/// Drive a candidate through `propose` -> `challenge`, then advance the
+/// ledger past `ARBITRATION_TIMELOCK_SECONDS` (172_800s, from `lib.rs`) so
+/// the admin-only arbitration entrypoints (`arbitrate_uphold_proposer`,
+/// `void_market`) accept it. Returns the candidate id, proposer and
+/// challenger.
+fn setup_challenged_candidate_past_timelock(
+    env: &Env,
+    client: &ResolutionContractClient,
+    token: &Address,
+    market_id: u32,
+    outcome: bool,
+) -> (u32, Address, Address) {
+    const ARBITRATION_TIMELOCK: u64 = 172_800; // mirrors lib.rs ARBITRATION_TIMELOCK_SECONDS
+    set_time(env, 1_000);
+    let proposer = Address::generate(env);
+    let challenger = Address::generate(env);
+    fund(env, token, &proposer, BOND);
+    fund(env, token, &challenger, BOND);
+    let expiry = 1_000 + 10 * DEFAULT_WINDOW;
+    let candidate_id = client.propose(
+        &proposer,
+        &market_id,
+        &outcome,
+        &signature(env),
+        &expiry,
+        &evidence(env),
+        &DEFAULT_WINDOW,
+        &BOND,
+    );
+    client.challenge(
+        &challenger,
+        &candidate_id,
+        &String::from_str(env, "ipfs://dispute"),
+        &BOND,
+    );
+    set_time(env, 1_000 + DEFAULT_WINDOW + ARBITRATION_TIMELOCK + 1);
+    (candidate_id, proposer, challenger)
+}
+
 /// A challenge after the window closes is rejected fail-closed: the candidate
 /// stays `Proposed`, no challenger is recorded, the challenger's bond is not
 /// taken, no `candidate_challenged` event fires, and finalize still works.
@@ -1738,6 +1796,65 @@ fn challenge_rejects_challenge_uri_over_max_bytes() {
     assert_eq!(balance(&env, &token, &challenger), BOND);
 }
 
+// ── Issue #1024: `challenge` enforces MIN_CHALLENGE_BOND_AMOUNT ──────────
+
+/// `challenge` with a bond below `MIN_CHALLENGE_BOND_AMOUNT` must be
+/// rejected with `InsufficientChallengeBond`, leave the candidate `Proposed`
+/// with no `ChallengeRecord` appended, and a bond of exactly the minimum
+/// must succeed and record exactly one challenger with that bond.
+#[test]
+fn challenge_rejects_bond_below_minimum_and_accepts_exact_minimum() {
+    let env = Env::default();
+    let (client, _, _, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
+    let candidate_id = client.propose(
+        &proposer,
+        &9u32,
+        &true,
+        &signature(&env),
+        &(1_000 + 10 * DEFAULT_WINDOW),
+        &evidence(&env),
+        &DEFAULT_WINDOW,
+        &BOND,
+    );
+
+    let challenger = Address::generate(&env);
+    fund(&env, &token, &challenger, crate::MIN_CHALLENGE_BOND_AMOUNT);
+    let uri = String::from_str(&env, "ipfs://below-min");
+    assert_eq!(
+        client.try_challenge(
+            &challenger,
+            &candidate_id,
+            &uri,
+            &(crate::MIN_CHALLENGE_BOND_AMOUNT - 1),
+        ),
+        Err(Ok(ContractError::InsufficientChallengeBond))
+    );
+
+    // Rejected challenge must not change candidate status or append a record.
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Proposed);
+    assert!(client.get_challengers(&candidate_id).is_empty());
+
+    // Exactly the minimum bond succeeds and records one challenger.
+    client.challenge(
+        &challenger,
+        &candidate_id,
+        &uri,
+        &crate::MIN_CHALLENGE_BOND_AMOUNT,
+    );
+    let challengers = client.get_challengers(&candidate_id);
+    assert_eq!(challengers.len(), 1);
+    let record = challengers.get(0).unwrap();
+    assert_eq!(record.challenger, challenger);
+    assert_eq!(record.bond, crate::MIN_CHALLENGE_BOND_AMOUNT);
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Challenged);
+}
+
 // ── Issue #1026: arbitration timelock gates arbitrate_uphold_proposer/void_market ──
 
 /// Drives a candidate through `rounds` challenge/appeal cycles (reusing the
@@ -1888,4 +2005,397 @@ fn arbitrate_uphold_proposer_succeeds_at_timelock_deadline_and_resolves_market()
     assert_eq!(resolved.outcome, arbitrated.outcome);
     assert!(!resolved.is_v2);
 }
+
+/// `appeal` on a candidate that was never challenged (still `Proposed`)
+/// must be rejected with `CandidateNotChallenged` and leave the candidate
+/// untouched at `appeal_round == 0`.
+#[test]
+fn appeal_rejects_a_never_challenged_candidate() {
+    let env = Env::default();
+    let (client, _, _, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
+    let candidate_id = client.propose(
+        &proposer,
+        &1u32,
+        &true,
+        &signature(&env),
+        &(env.ledger().timestamp() + MIN_WINDOW + 3_600),
+        &evidence(&env),
+        &MIN_WINDOW,
+        &BOND,
+    );
+
+    let err = client
+        .try_appeal(
+            &proposer,
+            &candidate_id,
+            &true,
+            &signature(&env),
+            &evidence(&env),
+            &MIN_WINDOW,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::CandidateNotChallenged);
+
+    // No state was mutated by the rejected call.
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Proposed);
+    assert_eq!(candidate.appeal_round, 0);
 }
+
+/// After `MAX_APPEAL_ROUNDS` successful challenge/appeal cycles, the next
+/// `appeal` must return `AppealLimitExceeded` and `appeal_round` must stay
+/// pinned at `MAX_APPEAL_ROUNDS`.
+#[test]
+fn appeal_enforces_max_appeal_rounds_cap() {
+    let env = Env::default();
+    let (client, _, _, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
+    let challenger = Address::generate(&env);
+    fund(
+        &env,
+        &token,
+        &challenger,
+        BOND * (crate::MAX_APPEAL_ROUNDS as i128 + 1),
+    );
+
+    // Propose once; every challenge/appeal cycle below re-verifies and resets
+    // this same candidate back to `Proposed` without advancing ledger time,
+    // so the fixed signature/challenge-window expiry stays valid throughout.
+    let candidate_id = client.propose(
+        &proposer,
+        &1u32,
+        &true,
+        &signature(&env),
+        &(env.ledger().timestamp() + MIN_WINDOW + 3_600),
+        &evidence(&env),
+        &MIN_WINDOW,
+        &BOND,
+    );
+
+    for round in 0..crate::MAX_APPEAL_ROUNDS {
+        client.challenge(&challenger, &candidate_id, &evidence(&env), &BOND);
+        client.appeal(
+            &proposer,
+            &candidate_id,
+            &true,
+            &signature(&env),
+            &evidence(&env),
+            &MIN_WINDOW,
+        );
+
+        let candidate = client.get_candidate(&candidate_id).unwrap();
+        assert_eq!(candidate.appeal_round, round + 1);
+        assert_eq!(candidate.status, crate::types::CandidateStatus::Proposed);
+    }
+
+    // Challenge once more so the candidate is `Challenged` at the cap, then
+    // the next `appeal` must be rejected.
+    client.challenge(&challenger, &candidate_id, &evidence(&env), &BOND);
+
+    let err = client
+        .try_appeal(
+            &proposer,
+            &candidate_id,
+            &true,
+            &signature(&env),
+            &evidence(&env),
+            &MIN_WINDOW,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::AppealLimitExceeded);
+
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.appeal_round, crate::MAX_APPEAL_ROUNDS);
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Challenged);
+}
+
+// ── Issue #1033: ResolutionRegistered and CandidateArbitrated events ────────
+
+/// `initialize` emits `ResolutionRegistered` with `factory` as the topic and
+/// `market_contract`/`registered_at` as data, with `registered_at` populated
+/// from the ledger timestamp.
+#[test]
+fn initialize_emits_resolution_registered_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_time(&env, 500);
+
+    let admin = Address::generate(&env);
+    let factory = Address::generate(&env);
+    let market_contract = Address::generate(&env);
+    let contract_id = env.register(ResolutionContract, ());
+    let client = ResolutionContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &factory, &market_contract, &DEFAULT_WINDOW);
+
+    let (topics, data) = find_event(&env, "resolution_registered");
+    let factory_topic: Address = topics.get(1).unwrap().into_val(&env);
+    assert_eq!(factory_topic, factory);
+
+    let got_market: Address = data
+        .get(Symbol::new(&env, "market_contract"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(got_market, market_contract);
+    let registered_at: u64 = data
+        .get(Symbol::new(&env, "registered_at"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(registered_at, 500);
+}
+
+/// `arbitrate_uphold_proposer` emits `CandidateArbitrated` with
+/// `candidate_id`/`market_id` topics and `outcome`/`arbitrated_at` data, with
+/// `arbitrated_at` populated from the ledger timestamp. Covers `outcome =
+/// true`.
+#[test]
+fn arbitrate_uphold_proposer_emits_candidate_arbitrated_for_true_outcome() {
+    let env = Env::default();
+    let (client, admin, _, token) = setup(&env);
+    let (candidate_id, _, _) =
+        setup_challenged_candidate_past_timelock(&env, &client, &token, 21u32, true);
+    let now = env.ledger().timestamp();
+
+    let candidate = client.arbitrate_uphold_proposer(&admin, &candidate_id);
+    assert_eq!(candidate.outcome, true);
+
+    let (topics, data) = find_event(&env, "candidate_arbitrated");
+    let id_topic: u32 = topics.get(1).unwrap().into_val(&env);
+    assert_eq!(id_topic, candidate_id);
+    let market_topic: u32 = topics.get(2).unwrap().into_val(&env);
+    assert_eq!(market_topic, 21u32);
+
+    let outcome: bool = data.get(Symbol::new(&env, "outcome")).unwrap().into_val(&env);
+    assert_eq!(outcome, true);
+    let arbitrated_at: u64 = data
+        .get(Symbol::new(&env, "arbitrated_at"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(arbitrated_at, now);
+}
+
+/// Same as above, covering `outcome = false`.
+#[test]
+fn arbitrate_uphold_proposer_emits_candidate_arbitrated_for_false_outcome() {
+    let env = Env::default();
+    let (client, admin, _, token) = setup(&env);
+    let (candidate_id, _, _) =
+        setup_challenged_candidate_past_timelock(&env, &client, &token, 22u32, false);
+    let now = env.ledger().timestamp();
+
+    let candidate = client.arbitrate_uphold_proposer(&admin, &candidate_id);
+    assert_eq!(candidate.outcome, false);
+
+    let (topics, data) = find_event(&env, "candidate_arbitrated");
+    let id_topic: u32 = topics.get(1).unwrap().into_val(&env);
+    assert_eq!(id_topic, candidate_id);
+    let market_topic: u32 = topics.get(2).unwrap().into_val(&env);
+    assert_eq!(market_topic, 22u32);
+
+    let outcome: bool = data.get(Symbol::new(&env, "outcome")).unwrap().into_val(&env);
+    assert_eq!(outcome, false);
+    let arbitrated_at: u64 = data
+        .get(Symbol::new(&env, "arbitrated_at"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(arbitrated_at, now);
+}
+
+// ── Issue #1032: BondSlashed and BondRefunded event payloads ────────────────
+
+/// `arbitrate_uphold_proposer` settles the losing challenger's bond via
+/// `split_bond`, which emits `BondSlashed` with `candidate_id`/`market_id`
+/// topics and the full payload. Asserts the production split always
+/// satisfies `reward + burned + treasury_cut == total`.
+#[test]
+fn arbitrate_uphold_proposer_emits_bond_slashed_with_conserved_split() {
+    let env = Env::default();
+    let (client, admin, _, token) = setup(&env);
+    let (candidate_id, proposer, challenger) =
+        setup_challenged_candidate_past_timelock(&env, &client, &token, 31u32, true);
+    let now = env.ledger().timestamp();
+
+    client.arbitrate_uphold_proposer(&admin, &candidate_id);
+
+    let (topics, data) = find_event(&env, "bond_slashed");
+    let id_topic: u32 = topics.get(1).unwrap().into_val(&env);
+    assert_eq!(id_topic, candidate_id);
+    let market_topic: u32 = topics.get(2).unwrap().into_val(&env);
+    assert_eq!(market_topic, 31u32);
+
+    let loser: Address = data.get(Symbol::new(&env, "loser")).unwrap().into_val(&env);
+    assert_eq!(loser, challenger);
+    let winner: Address = data.get(Symbol::new(&env, "winner")).unwrap().into_val(&env);
+    assert_eq!(winner, proposer);
+    let total: i128 = data.get(Symbol::new(&env, "total")).unwrap().into_val(&env);
+    assert_eq!(total, BOND);
+    let reward: i128 = data.get(Symbol::new(&env, "reward")).unwrap().into_val(&env);
+    let burned: i128 = data.get(Symbol::new(&env, "burned")).unwrap().into_val(&env);
+    let treasury_cut: i128 = data
+        .get(Symbol::new(&env, "treasury_cut"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(
+        reward + burned + treasury_cut,
+        total,
+        "reward + burned + treasury_cut must always equal total"
+    );
+    let slashed_at: u64 = data.get(Symbol::new(&env, "slashed_at")).unwrap().into_val(&env);
+    assert_eq!(slashed_at, now);
+}
+
+/// Documents that the `BondSlashed` event itself does not enforce the
+/// reward/burned/treasury_cut split invariant -- it simply records whatever
+/// is passed to `emit_bond_slashed`. The production `split_bond` helper is
+/// the thing that always computes a consistent split (covered above); this
+/// shows the event payload has no independent validation of its own.
+#[test]
+fn bond_slashed_event_does_not_itself_enforce_split_invariant() {
+    let env = Env::default();
+    let contract_id = env.register(ResolutionContract, ());
+    set_time(&env, 42);
+    let loser = Address::generate(&env);
+    let winner = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        crate::events::emit_bond_slashed(
+            &env, 1u32, 2u32, &loser, &winner, 100i128, 10i128, 10i128, 10i128,
+        );
+    });
+
+    let (topics, data) = find_event(&env, "bond_slashed");
+    let id_topic: u32 = topics.get(1).unwrap().into_val(&env);
+    assert_eq!(id_topic, 1u32);
+    let market_topic: u32 = topics.get(2).unwrap().into_val(&env);
+    assert_eq!(market_topic, 2u32);
+    let total: i128 = data.get(Symbol::new(&env, "total")).unwrap().into_val(&env);
+    let reward: i128 = data.get(Symbol::new(&env, "reward")).unwrap().into_val(&env);
+    let burned: i128 = data.get(Symbol::new(&env, "burned")).unwrap().into_val(&env);
+    let treasury_cut: i128 = data
+        .get(Symbol::new(&env, "treasury_cut"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(total, 100i128);
+    assert_ne!(reward + burned + treasury_cut, total);
+}
+
+/// `void_market` refunds every recorded challenger in full, emitting
+/// `BondRefunded` with `candidate_id`/`market_id` topics and the
+/// `recipient`/`amount`/`refunded_at` payload.
+#[test]
+fn void_market_emits_bond_refunded_for_challenger() {
+    let env = Env::default();
+    let (client, admin, _, token) = setup(&env);
+    let (candidate_id, _, challenger) =
+        setup_challenged_candidate_past_timelock(&env, &client, &token, 41u32, true);
+    let now = env.ledger().timestamp();
+    let before = balance(&env, &token, &challenger);
+
+    client.void_market(&admin, &candidate_id);
+
+    let (topics, data) = find_event(&env, "bond_refunded");
+    let id_topic: u32 = topics.get(1).unwrap().into_val(&env);
+    assert_eq!(id_topic, candidate_id);
+    let market_topic: u32 = topics.get(2).unwrap().into_val(&env);
+    assert_eq!(market_topic, 41u32);
+
+    let recipient: Address = data
+        .get(Symbol::new(&env, "recipient"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(recipient, challenger);
+    let amount: i128 = data.get(Symbol::new(&env, "amount")).unwrap().into_val(&env);
+    assert_eq!(amount, BOND);
+    let refunded_at: u64 = data
+        .get(Symbol::new(&env, "refunded_at"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(refunded_at, now);
+    assert_eq!(balance(&env, &token, &challenger), before + BOND);
+}
+
+/// `BondRefunded` supports a zero `amount` payload (e.g. a recorded
+/// challenger whose bond was already zero) -- exercised directly since the
+/// production `void_market` path only calls `emit_bond_refunded` for
+/// `bond > 0`.
+#[test]
+fn bond_refunded_event_supports_zero_amount_payload() {
+    let env = Env::default();
+    let contract_id = env.register(ResolutionContract, ());
+    set_time(&env, 777);
+    let recipient = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        crate::events::emit_bond_refunded(&env, 9u32, 3u32, &recipient, 0i128);
+    });
+
+    let (topics, data) = find_event(&env, "bond_refunded");
+    let id_topic: u32 = topics.get(1).unwrap().into_val(&env);
+    assert_eq!(id_topic, 9u32);
+    let market_topic: u32 = topics.get(2).unwrap().into_val(&env);
+    assert_eq!(market_topic, 3u32);
+    let got_recipient: Address = data
+        .get(Symbol::new(&env, "recipient"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(got_recipient, recipient);
+    let amount: i128 = data.get(Symbol::new(&env, "amount")).unwrap().into_val(&env);
+    assert_eq!(amount, 0i128);
+    let refunded_at: u64 = data
+        .get(Symbol::new(&env, "refunded_at"))
+        .unwrap()
+        .into_val(&env);
+    assert_eq!(refunded_at, 777);
+}
+}
+
+/// Issue #1023: `finalize` must reject a candidate whose `signature_expiry`
+/// has passed, leaving it `Proposed` with `finalized_at` still `None` and
+/// without ever invoking the market contract's `resolve_market`.
+#[test]
+fn finalize_rejects_expired_signature_and_leaves_candidate_unresolved() {
+    let env = Env::default();
+    let (client, _, market_contract, token) = setup(&env);
+    set_time(&env, 1_000);
+
+    let proposer = Address::generate(&env);
+    fund(&env, &token, &proposer, BOND);
+    let window = 300u64;
+    // Expiry one second past the challenge deadline, so the window has
+    // closed but the signature has also already expired.
+    let expiry = 1_000 + window;
+    let candidate_id = client.propose(
+        &proposer,
+        &10u32,
+        &true,
+        &signature(&env),
+        &expiry,
+        &evidence(&env),
+        &window,
+        &BOND,
+    );
+
+    set_time(&env, expiry + 1);
+    let finalizer = Address::generate(&env);
+    assert_eq!(
+        client.try_finalize(&finalizer, &candidate_id),
+        Err(Ok(ContractError::SignatureExpired))
+    );
+
+    let candidate = client.get_candidate(&candidate_id).unwrap();
+    assert_eq!(candidate.status, crate::types::CandidateStatus::Proposed);
+    assert_eq!(candidate.finalized_at, None);
+
+    let market_client = MockMarketClient::new(&env, &market_contract);
+    assert_eq!(market_client.get_last_resolved(), None);
+}
+

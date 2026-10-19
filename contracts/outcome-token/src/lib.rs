@@ -424,4 +424,25 @@ impl OutcomeTokenContract {
     pub fn total_supply(env: Env, market_id: u32, kind: TokenKind) -> i128 {
         storage::get_total_supply(&env, market_id, &kind)
     }
+
+    /// Issue #1035: `set_metadata`'s deny-by-default branch — no config ever
+    /// stored (contract never `initialize`d) — must reject even when the
+    /// caller self-authorizes, and must not write any metadata. Ported to
+    /// the restored multi-market API (#1036/#1037): the fail-closed check is
+    /// now `ContractError::NotInitialized` via `storage::has_config`, not
+    /// the single-admin `DataKey::Admin`/`OutcomeTokenError` this test was
+    /// originally written against.
+    #[test]
+    fn set_metadata_rejects_when_never_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, OutcomeTokenContract);
+        let client = OutcomeTokenContractClient::new(&env, &contract_id);
+
+        // No `initialize` call: no `Config` is ever stored.
+        let caller = Address::generate(&env);
+        let res = client.try_set_metadata(&caller, &symbol(&env, 4), &name(&env, 4));
+        assert_eq!(res, Err(Ok(ContractError::NotInitialized)));
+    }
+
 }
